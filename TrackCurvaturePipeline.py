@@ -3,12 +3,15 @@ import os
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 from scipy.interpolate import CubicSpline
 
 from GetData import SESSIONS_DIR, YEAR_FILE_PATTERN, openf1_get
 
+PLOTS_DIR = "Plots"
 
-def fit_splines(df: pd.DataFrame, bc_type: str = "not-a-knot"):
+
+def fit_splines(df: pd.DataFrame, bc_type: str = "not-a-knot", closed: bool = False):
     """
     Fit piecewise cubic splines to the x, y, z columns of df, parametrized
     by cumulative chord-length distance between consecutive points.
@@ -17,9 +20,19 @@ def fit_splines(df: pd.DataFrame, bc_type: str = "not-a-knot"):
     segment already matches first and second derivatives with its
     neighbors at every point where they connect.
 
+    If closed is True, a copy of the first point is appended after the
+    last one, adding a segment that closes the loop back to the start,
+    and bc_type is forced to "periodic" so that closing segment also
+    matches first and second derivatives with its neighbors instead of
+    just being a plain line back to the start.
+
     Returns (t, splines) where t is the parameter array and splines is a
     dict of CubicSpline objects keyed by 'x', 'y', 'z'.
     """
+    if closed:
+        df = pd.concat([df, df.iloc[[0]]], ignore_index=True)
+        bc_type = "periodic"
+
     x = df["x"].to_numpy(dtype=float)
     y = df["y"].to_numpy(dtype=float)
     z = df["z"].to_numpy(dtype=float)
@@ -74,9 +87,14 @@ def get_track_curvatures():
     the last lap's date_start (its end) - the final lap entry itself is
     typically an incomplete in/out lap.
 
+    Also plots each circuit's raw points and fitted splines together on
+    an interactive 3D figure and saves it to Plots/{circuit_key}.html -
+    open it in a browser to rotate/zoom/pan.
+
     Returns a dict mapping circuit_key -> total curvature (the integral
     of curvature over arc length), one entry per distinct circuit.
     """
+    os.makedirs(PLOTS_DIR, exist_ok=True)
     circuit_map = {}
 
     for filename in os.listdir(SESSIONS_DIR):
@@ -87,7 +105,7 @@ def get_track_curvatures():
             sessions = json.load(f)
 
         for session in sessions:
-            if session["session_name"] != "Qualifying":
+            if session["session_name"] != "Race":
                 continue
 
             circuit_key = session["circuit_key"]
@@ -103,8 +121,8 @@ def get_track_curvatures():
             if len(laps) < 2:
                 continue
 
-            last_lap_start = laps[-1]["date_start"]
-            second_last_lap_start = laps[-2]["date_start"]
+            last_lap_start = laps[1]["date_start"]
+            second_last_lap_start = laps[0]["date_start"]
 
             location = openf1_get(
                 "location",
@@ -120,9 +138,52 @@ def get_track_curvatures():
 
             df = pd.DataFrame(location)[["x", "y", "z"]]
 
-            t, splines = fit_splines(df)
+            t, splines = fit_splines(df, closed=True)
             kappa = compute_curvature(splines, t)
             circuit_map[circuit_key] = np.trapezoid(kappa, t)
+
+            t_fine = np.linspace(t[0], t[-1], 500)
+            spline_x, spline_y, spline_z = (splines[c](t_fine) for c in "xyz")
+
+            fig = go.Figure(
+                data=[
+                    go.Scatter3d(
+                        x=df["x"],
+                        y=df["y"],
+                        z=df["z"],
+                        mode="markers",
+                        name="points",
+                        marker=dict(size=3, color="royalblue"),
+                    ),
+                    go.Scatter3d(
+                        x=spline_x,
+                        y=spline_y,
+                        z=spline_z,
+                        mode="lines",
+                        name="spline",
+                        line=dict(width=4, color="orange"),
+                    ),
+                ]
+            )
+            fig.update_layout(
+                title=f"Circuit {circuit_key}",
+                scene=dict(
+                    # aspectmode="data" scales x/y/z uniformly to their
+                    # actual data ranges, instead of z being auto-stretched
+                    # to fill the same visual size as the much larger x/y
+                    # extent.
+                    aspectmode="data",
+                    # Camera positioned straight above, looking down the
+                    # z-axis onto the xy plane. A larger eye distance is
+                    # needed here than feels intuitive because aspectmode
+                    # "data" makes the scene's bounding box very wide and
+                    # flat (x/y span hundreds/thousands of units, z only
+                    # tens), so a small eye distance only frames a tiny
+                    # corner of the track on initial load.
+                    camera=dict(eye=dict(x=0, y=0, z=10), up=dict(x=0, y=1, z=0)),
+                ),
+            )
+            fig.write_html(os.path.join(PLOTS_DIR, f"{circuit_key}.html"))
 
     return circuit_map
 
