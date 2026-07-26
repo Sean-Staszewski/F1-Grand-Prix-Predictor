@@ -74,6 +74,7 @@ def get_sessions():
                 "session_key": session["session_key"],
                 "meeting_key": session["meeting_key"],
                 "circuit_key": session["circuit_key"],
+                "circuit_short_name": session["circuit_short_name"],
                 "session_name": session["session_name"],
                 "session_type": session["session_type"],
             }
@@ -145,6 +146,7 @@ def get_weather():
         weather = [
             {
                 "session_key": entry["session_key"],
+                "date": entry["date"],
                 "air_temperature": entry["air_temperature"],
                 "track_temperature": entry["track_temperature"],
                 "humidity": entry["humidity"],

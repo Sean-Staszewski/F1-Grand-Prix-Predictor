@@ -88,7 +88,7 @@ def get_track_curvatures():
     typically an incomplete in/out lap.
 
     Also plots each circuit's raw points and fitted splines together on
-    an interactive 3D figure and saves it to Plots/{circuit_key}.html -
+    an interactive 3D figure and saves it to Plots/{circuit_short_name}.html -
     open it in a browser to rotate/zoom/pan.
 
     Returns a dict mapping circuit_key -> total curvature (the integral
@@ -109,6 +109,7 @@ def get_track_curvatures():
                 continue
 
             circuit_key = session["circuit_key"]
+            circuit_name = session["circuit_short_name"]
             if circuit_key in circuit_map:
                 continue
 
@@ -166,7 +167,7 @@ def get_track_curvatures():
                 ]
             )
             fig.update_layout(
-                title=f"Circuit {circuit_key}",
+                title=circuit_name,
                 scene=dict(
                     # aspectmode="data" scales x/y/z uniformly to their
                     # actual data ranges, instead of z being auto-stretched
@@ -183,7 +184,7 @@ def get_track_curvatures():
                     camera=dict(eye=dict(x=0, y=0, z=10), up=dict(x=0, y=1, z=0)),
                 ),
             )
-            fig.write_html(os.path.join(PLOTS_DIR, f"{circuit_key}.html"))
+            fig.write_html(os.path.join(PLOTS_DIR, f"{circuit_name}.html"))
 
     return circuit_map
 
