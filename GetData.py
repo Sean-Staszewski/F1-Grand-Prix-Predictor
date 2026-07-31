@@ -4,6 +4,7 @@ import re
 import time
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -13,8 +14,10 @@ LAPS_DIR = "Laps"
 WEATHER_DIR = "Weather"
 DRIVERS_DIR = "Drivers"
 GRID_POSITIONS_DIR = "GridPositions"
+MASTER_FILE = "Master.json"
 YEAR_FILE_PATTERN = re.compile(r"^\d{4}\.json$")
 TESTING_DAY_PATTERN = re.compile(r"^Day \d+$")
+WEATHER_COLUMNS = ["air_temperature", "track_temperature", "humidity", "rainfall"]
 
 
 def openf1_get(endpoint, params=None, max_retries=5):
@@ -256,6 +259,142 @@ def get_grid_positions():
             json.dump(positions, f, indent=2)
 
 
+def _match_weather_to_laps(laps, weather):
+    """
+    Match each lap to weather data by date. laps and weather must both
+    already be sorted ascending by date_start/date, with laps indexed
+    0..n-1 (weather's index doesn't matter).
+
+    Weather is sampled roughly once a minute, so a lap can span zero,
+    one, or several samples:
+      - If one or more samples fall within [date_start, lap_end], their
+        values are averaged.
+      - If none do (e.g. a short lap, or an in/out lap with no known
+        duration so lap_end == date_start), the single closest sample by
+        date is used instead.
+
+    Returns a DataFrame of WEATHER_COLUMNS values, one row per lap,
+    aligned positionally to laps.
+    """
+    w_dates = weather["date"].to_numpy()
+    w_values = weather[WEATHER_COLUMNS].to_numpy(dtype=float)
+    # Prepend a zero row so cumsum[i] is the sum of the first i weather
+    # rows, letting the sum within a window be a plain difference of two
+    # lookups instead of slicing and summing per lap.
+    cumsum = np.vstack([np.zeros((1, w_values.shape[1])), np.cumsum(w_values, axis=0)])
+
+    lo = np.searchsorted(w_dates, laps["date_start"].to_numpy(), side="left")
+    hi = np.searchsorted(w_dates, laps["lap_end"].to_numpy(), side="right")
+    counts = hi - lo
+
+    with np.errstate(invalid="ignore"):
+        within_window = (cumsum[hi] - cumsum[lo]) / counts[:, None]
+
+    nearest = pd.merge_asof(
+        laps[["date_start"]],
+        weather[["date", *WEATHER_COLUMNS]],
+        left_on="date_start",
+        right_on="date",
+        direction="nearest",
+    )[WEATHER_COLUMNS].to_numpy()
+
+    matched = np.where(counts[:, None] > 0, within_window, nearest)
+    return pd.DataFrame(matched, columns=WEATHER_COLUMNS, index=laps.index)
+
+
+def build_master_df():
+    """
+    Combine every downloaded dataset into a single master DataFrame, one
+    row per lap.
+
+    Weather is matched to each lap by date, as described in
+    _match_weather_to_laps(). Session metadata (circuit, session type)
+    is merged in by session_key, driver team by driver_number within the
+    session's meeting_key, and grid position by session_key and
+    driver_number.
+
+    Laps with no date_start can't be matched to weather or ordered
+    against other laps, so they're dropped. Sessions missing their Laps
+    or Weather file entirely are skipped.
+
+    Returns a DataFrame with one row per matchable lap.
+    """
+    sessions_by_key = {}
+    for filename in os.listdir(SESSIONS_DIR):
+        if not YEAR_FILE_PATTERN.match(filename):
+            continue
+
+        with open(os.path.join(SESSIONS_DIR, filename)) as f:
+            for session in json.load(f):
+                sessions_by_key[session["session_key"]] = session
+
+    driver_teams = {}
+    for filename in os.listdir(DRIVERS_DIR):
+        meeting_key = int(os.path.splitext(filename)[0])
+        with open(os.path.join(DRIVERS_DIR, filename)) as f:
+            drivers = json.load(f)
+        driver_teams[meeting_key] = {
+            driver["driver_number"]: driver["team_name"] for driver in drivers
+        }
+
+    session_lap_frames = []
+
+    for session_key, session in sessions_by_key.items():
+        laps_path = os.path.join(LAPS_DIR, f"{session_key}.json")
+        weather_path = os.path.join(WEATHER_DIR, f"{session_key}.json")
+        if not (os.path.exists(laps_path) and os.path.exists(weather_path)):
+            continue
+
+        with open(laps_path) as f:
+            laps = pd.DataFrame(json.load(f))
+        with open(weather_path) as f:
+            weather = pd.DataFrame(json.load(f))
+        if laps.empty or weather.empty:
+            continue
+
+        laps = laps[laps["date_start"].notna()].copy()
+        if laps.empty:
+            continue
+
+        laps["date_start"] = pd.to_datetime(laps["date_start"], format="ISO8601")
+        laps["lap_end"] = laps["date_start"] + pd.to_timedelta(
+            laps["lap_duration"].fillna(0), unit="s"
+        )
+        laps = laps.sort_values("date_start").reset_index(drop=True)
+
+        weather["date"] = pd.to_datetime(weather["date"], format="ISO8601")
+        weather = weather.sort_values("date").reset_index(drop=True)
+
+        laps[WEATHER_COLUMNS] = _match_weather_to_laps(laps, weather)
+        laps = laps.drop(columns="lap_end")
+
+        laps["meeting_key"] = session["meeting_key"]
+        laps["circuit_key"] = session["circuit_key"]
+        laps["circuit_short_name"] = session["circuit_short_name"]
+        laps["session_name"] = session["session_name"]
+        laps["session_type"] = session["session_type"]
+
+        team_map = driver_teams.get(session["meeting_key"], {})
+        laps["team_name"] = laps["driver_number"].map(team_map)
+
+        grid_path = os.path.join(GRID_POSITIONS_DIR, f"{session_key}.json")
+        if os.path.exists(grid_path):
+            with open(grid_path) as f:
+                grid = pd.DataFrame(json.load(f))
+            laps = laps.merge(
+                grid[["driver_number", "position", "has_grid_position"]],
+                on="driver_number",
+                how="left",
+            )
+
+        session_lap_frames.append(laps)
+
+    if not session_lap_frames:
+        return pd.DataFrame()
+
+    return pd.concat(session_lap_frames, ignore_index=True)
+
+
 def main():
     """
     Download every dataset, in dependency order (laps, weather, and grid
@@ -290,6 +429,11 @@ def main():
             f"Laps={lap_count}, Weather={weather_count}, "
             f"GridPositions={grid_position_count}"
         )
+
+    master_df = build_master_df()
+    master_df.to_json(MASTER_FILE, orient="records", date_format="iso", indent=2)
+    print(f"Saved {len(master_df)} laps to {MASTER_FILE}.")
+
 
 if __name__ == "__main__":
     main()
