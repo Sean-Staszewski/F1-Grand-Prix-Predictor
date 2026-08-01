@@ -5,3 +5,5 @@ Drivers/
 GridPositions/
 CurcuitCurvatures.json
 Plots/
+__pycache__/
+venv/
