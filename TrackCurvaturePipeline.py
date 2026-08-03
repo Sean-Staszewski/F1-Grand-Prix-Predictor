@@ -10,6 +10,12 @@ from GetData import SESSIONS_DIR, YEAR_FILE_PATTERN, openf1_get
 
 PLOTS_DIR = "Plots"
 
+# OpenF1's /location x, y, z are in tenths of a meter, not meters -
+# confirmed by comparing summed chord length against known official lap
+# distances (e.g. Monaco's ~3337 m, Montreal's ~4361 m both come out to
+# within ~2% once divided by 10).
+METERS_PER_UNIT = 0.1
+
 
 def fit_splines(df: pd.DataFrame, bc_type: str = "not-a-knot", closed: bool = False):
     """
@@ -82,17 +88,29 @@ def get_track_curvatures():
     collecting every circuit's raw location data before processing any
     of it.
 
-    A lap's date_start marks when it begins, so the last full lap is the
-    interval between the second-to-last lap's date_start (its start) and
-    the last lap's date_start (its end) - the final lap entry itself is
-    typically an incomplete in/out lap.
+    A lap's date_start marks when it begins, so a full lap is the
+    interval between one lap's date_start (its start) and the next lap's
+    date_start (its end). The last lap of a race is especially likely to
+    be contaminated by things that aren't a clean racing lap - a red
+    flag or safety car parking the field for minutes, or the winner
+    doing a slow-down/celebration lap before crossing back through the
+    timing loop - so instead of blindly trusting the final pair, this
+    walks backward from the end of the race looking for the most recent
+    lap whose actual elapsed time (next lap's date_start minus this
+    lap's date_start) is within 1.5x the session's median lap_duration,
+    and uses that as the "last full lap" instead.
 
     Also plots each circuit's raw points and fitted splines together on
     an interactive 3D figure and saves it to Plots/{circuit_short_name}.html -
     open it in a browser to rotate/zoom/pan.
 
-    Returns a dict mapping circuit_key -> total curvature (the integral
-    of curvature over arc length), one entry per distinct circuit.
+    Returns a dict mapping circuit_key -> {"total_curvature": ...,
+    "length_m": ...}, one entry per distinct circuit. total_curvature is
+    the integral of curvature over arc length (total turning angle, in
+    radians) and is scale-invariant, so it captures how twisty a track
+    is independent of its size - length_m (the lap's arc length,
+    converted from OpenF1's native units via METERS_PER_UNIT) is stored
+    alongside it so track size isn't lost.
     """
     os.makedirs(PLOTS_DIR, exist_ok=True)
     circuit_map = {}
@@ -122,8 +140,23 @@ def get_track_curvatures():
             if len(laps) < 2:
                 continue
 
-            last_lap_start = laps[1]["date_start"]
-            second_last_lap_start = laps[0]["date_start"]
+            durations = [lap["lap_duration"] for lap in laps if lap["lap_duration"]]
+            if not durations:
+                continue
+            median_duration = np.median(durations)
+
+            second_last_lap_start = last_lap_start = None
+            for i in range(len(laps) - 2, -1, -1):
+                start, end = laps[i]["date_start"], laps[i + 1]["date_start"]
+                if not (start and end):
+                    continue
+                gap = (pd.Timestamp(end) - pd.Timestamp(start)).total_seconds()
+                if gap <= 1.5 * median_duration:
+                    second_last_lap_start, last_lap_start = start, end
+                    break
+
+            if last_lap_start is None:
+                continue
 
             location = openf1_get(
                 "location",
@@ -141,7 +174,10 @@ def get_track_curvatures():
 
             t, splines = fit_splines(df, closed=True)
             kappa = compute_curvature(splines, t)
-            circuit_map[circuit_key] = np.trapezoid(kappa, t)
+            circuit_map[circuit_key] = {
+                "total_curvature": np.trapezoid(kappa, t),
+                "length_m": t[-1] * METERS_PER_UNIT,
+            }
 
             t_fine = np.linspace(t[0], t[-1], 500)
             spline_x, spline_y, spline_z = (splines[c](t_fine) for c in "xyz")
@@ -191,13 +227,17 @@ def get_track_curvatures():
 
 def main():
     """
-    Compute total curvature for every circuit and save circuit_key ->
-    curvature to CurcuitCurvatures.json.
+    Compute total curvature and length for every circuit and save
+    circuit_key -> {"total_curvature", "length_m"} to
+    CurcuitCurvatures.json.
     """
     circuit_curvatures = get_track_curvatures()
     circuit_curvatures = {
-        circuit_key: float(curvature)
-        for circuit_key, curvature in circuit_curvatures.items()
+        circuit_key: {
+            "total_curvature": float(stats["total_curvature"]),
+            "length_m": float(stats["length_m"]),
+        }
+        for circuit_key, stats in circuit_curvatures.items()
     }
 
     with open("CurcuitCurvatures.json", "w") as f:
